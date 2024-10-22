@@ -1,36 +1,26 @@
 package com.gertech.aws_plugin;
 
 import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
-
 import androidx.annotation.NonNull;
-
 import com.amazonaws.ClientConfiguration;
-import com.amazonaws.SDKGlobalConfiguration;
-import com.amazonaws.auth.CognitoCredentialsProvider;
 import com.amazonaws.mobile.client.AWSMobileClient;
 import com.amazonaws.mobileconnectors.s3.transferutility.TransferListener;
 import com.amazonaws.mobileconnectors.s3.transferutility.TransferObserver;
 import com.amazonaws.mobileconnectors.s3.transferutility.TransferState;
 import com.amazonaws.mobileconnectors.s3.transferutility.TransferUtility;
+import com.amazonaws.regions.Region;
 import com.amazonaws.regions.Regions;
 import com.amazonaws.services.s3.AmazonS3Client;
-import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.model.CannedAccessControlList;
 import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.services.s3.model.GeneratePresignedUrlRequest;
 import com.amazonaws.HttpMethod;
-
 import java.io.File;
 import java.net.URL;
 import java.util.Calendar;
 import java.util.Date;
-
-import io.flutter.embedding.engine.FlutterEngine;
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
-import io.flutter.embedding.engine.plugins.shim.ShimPluginRegistry;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodCall;
@@ -39,38 +29,31 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
 import io.flutter.plugin.common.PluginRegistry;
 
-/**
- * AwsPlugin
- */
 public class AwsPlugin implements FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
-    /// The MethodChannel that will the communication between Flutter and native Android
-    ///
-    /// This local reference serves to register the plugin with the Flutter Engine and unregister it
-    /// when the Flutter Engine is detached from the Activity
     private static final String TAG = "awsPlugin";
     private static final String CHANNEL = "com.gertech.aws_plugin";
     private static final String STREAM = "uploading_status";
-    static final String METHOD_CALL_UPLOAD = "uploadToS3";
-    static final String METHOD_CALL_PRESIGNED = "createPreSignedURL";
-    private String AWSAccess;
-    private String AWSSecret;
+    private static final String METHOD_CALL_UPLOAD = "uploadToS3";
+    private static final String METHOD_CALL_PRESIGNED = "createPreSignedURL";
+    private static final long EIGHT_HOURS_IN_MILLIS = 480 * 60000;
+
     private String filePath;
     private String awsFolder;
     private String fileNameWithExt;
-    private MethodChannel.Result parentResult;
-    private ClientConfiguration clientConfiguration;
-    private TransferUtility transferUtility1;
     private String bucketName;
     private Context mContext;
-    private EventChannel eventChannel;
     private MethodChannel methodChannel;
+    private EventChannel eventChannel;
     private EventChannel.EventSink events;
+    private Result parentResult;
+    private AmazonS3Client s3Client;
+    private TransferUtility transferUtility;
+
+    private final ClientConfiguration clientConfiguration = new ClientConfiguration();
 
     public AwsPlugin() {
-        filePath = "";
-        awsFolder = "";
-        fileNameWithExt = "";
-        clientConfiguration = new ClientConfiguration();
+        clientConfiguration.setConnectionTimeout(250000);
+        clientConfiguration.setSocketTimeout(250000);
     }
 
     public static void registerWith(PluginRegistry.Registrar registrar) {
@@ -89,10 +72,8 @@ public class AwsPlugin implements FlutterPlugin, MethodCallHandler, EventChannel
         eventChannel = new EventChannel(messenger, STREAM);
         eventChannel.setStreamHandler(this);
         methodChannel.setMethodCallHandler(this);
-
         Log.d(TAG, "whenAttachedToEngine");
     }
-
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
@@ -101,100 +82,84 @@ public class AwsPlugin implements FlutterPlugin, MethodCallHandler, EventChannel
         methodChannel = null;
         eventChannel.setStreamHandler(null);
         eventChannel = null;
-
         Log.d(TAG, "onDetachedFromEngine");
     }
 
     @Override
     public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
-
-
         parentResult = result;
+        String awsAccess = call.argument("AWSAccess");
+        String awsSecret = call.argument("AWSSecret");
         filePath = call.argument("filePath");
-        Log.d(TAG, "onMethodCall : file path ==> : " + filePath);
         awsFolder = call.argument("awsFolder");
         fileNameWithExt = call.argument("fileNameWithExt");
         bucketName = call.argument("bucketName");
-        AWSAccess = call.argument("AWSAccess");
-        AWSSecret = call.argument("AWSSecret");
+
+        if (s3Client == null && awsAccess != null && awsSecret != null) {
+            BasicAWSCredentials awsCreds = new BasicAWSCredentials(awsAccess, awsSecret);
+            s3Client = new AmazonS3Client(awsCreds, clientConfiguration);
+        }
+
         switch (call.method) {
             case METHOD_CALL_UPLOAD:
-                try {
-
-                    clientConfiguration.setConnectionTimeout(250000);
-                    clientConfiguration.setSocketTimeout(250000);
-                    AmazonS3Client s3Client = new AmazonS3Client(new BasicAWSCredentials(AWSAccess, AWSSecret));
-                    transferUtility1 = TransferUtility.builder().context(mContext).awsConfiguration(AWSMobileClient.getInstance().getConfiguration()).s3Client(s3Client).build();
-                    sendImage();
-                } catch (Exception e) {
-                    Log.e(TAG, "onMethodCall: exception: " + e.getMessage());
-                }
+                setupTransferUtility();
+                sendImage();
                 break;
             case METHOD_CALL_PRESIGNED:
-                getPreSinedURL(call, result);
+                generatePreSignedUrl(call, result);
                 break;
             default:
                 result.notImplemented();
         }
     }
 
-    private void getPreSinedURL(@NonNull MethodCall call, @NonNull Result result) {
-        String reg = call.argument("region");
-        assert reg != null;
-        String objectKey = fileNameWithExt;
-        if (awsFolder != null && !awsFolder.equals("")) {
-            objectKey = awsFolder + "/" + fileNameWithExt;
+    private void setupTransferUtility() {
+        if (transferUtility == null) {
+            transferUtility = TransferUtility.builder()
+                    .context(mContext)
+                    .awsConfiguration(AWSMobileClient.getInstance().getConfiguration())
+                    .s3Client(s3Client)
+                    .build();
         }
+    }
+
+    private void generatePreSignedUrl(@NonNull MethodCall call, @NonNull Result result) {
+        String region = call.argument("region");
+        String objectKey = awsFolder != null && !awsFolder.isEmpty() ? awsFolder + "/" + fileNameWithExt : fileNameWithExt;
+
         try {
-            BasicAWSCredentials awsCreds = new BasicAWSCredentials(AWSAccess, AWSSecret);
-            ClientConfiguration clientConfiguration = new ClientConfiguration();
-            clientConfiguration.setSignerOverride("AWSS3V4SignerType");
+            Regions awsRegion = Regions.valueOf(region != null ? region.replaceFirst("Regions.", "") : null);
+            s3Client.setRegion(Region.getRegion(awsRegion));
 
-            AmazonS3Client s3Client = new AmazonS3Client(
-                    awsCreds, clientConfiguration);
-            String regionName = reg.replaceFirst("Regions.", "");
-            Regions region = Regions.valueOf(regionName);
-            s3Client.setRegion(com.amazonaws.regions.Region.getRegion(region));
+            Calendar calendar = Calendar.getInstance();
+            Date expiration = new Date(calendar.getTimeInMillis() + EIGHT_HOURS_IN_MILLIS);
 
-            long ONE_MINUTE_IN_MILLIS = 60000;
-            Calendar date = Calendar.getInstance();
-            long t = date.getTimeInMillis();
+            GeneratePresignedUrlRequest request = new GeneratePresignedUrlRequest(bucketName, objectKey)
+                    .withMethod(HttpMethod.GET)
+                    .withExpiration(expiration);
 
-            Date afterAddingFiveMins = new Date(t + (480 * ONE_MINUTE_IN_MILLIS)); // 8 hours
-
-            GeneratePresignedUrlRequest generatePresignedUrlRequest =
-                    new GeneratePresignedUrlRequest(bucketName, objectKey)
-                            .withMethod(HttpMethod.GET)
-                            .withExpiration(afterAddingFiveMins);
-
-            URL objectURL = s3Client.generatePresignedUrl(generatePresignedUrlRequest);
-
-            System.out.println("Pre-Signed URL: " + objectURL.toString());
-            parentResult.success(objectURL.toString());
+            URL preSignedUrl = s3Client.generatePresignedUrl(request);
+            result.success(preSignedUrl.toString());
         } catch (Exception e) {
-            parentResult.success(null);
-            e.getMessage();
+            Log.e(TAG, "Error generating presigned URL: ", e);
+            result.success(null);
         }
     }
 
     private void sendImage() {
-        String awsPath = fileNameWithExt;
-        if (awsFolder != null && !awsFolder.equals("")) {
-            awsPath = awsFolder + "/" + fileNameWithExt;
-        }
-        Log.d(TAG, "fileinfo:" + awsPath);
-        TransferObserver transferObserver1 = transferUtility1
-                .upload(bucketName, awsPath, new File(filePath), CannedAccessControlList.Private);
+        String awsPath = awsFolder != null && !awsFolder.isEmpty() ? awsFolder + "/" + fileNameWithExt : fileNameWithExt;
+        Log.d(TAG, "Uploading file: " + awsPath);
 
-        transferObserver1.setTransferListener(new Transfer());
+        TransferObserver observer = transferUtility.upload(bucketName, awsPath, new File(filePath), CannedAccessControlList.Private);
+        observer.setTransferListener(new UploadTransferListener());
     }
 
-    //  @Override
+    @Override
     public void onListen(Object arguments, EventChannel.EventSink events) {
         this.events = events;
     }
 
-    //  @Override
+    @Override
     public void onCancel(Object arguments) {
         invalidateEventSink();
     }
@@ -206,57 +171,33 @@ public class AwsPlugin implements FlutterPlugin, MethodCallHandler, EventChannel
         }
     }
 
-    class Transfer implements TransferListener {
-
-        private static final String TAG = "Transfer";
-
-        //    @Override
+    private class UploadTransferListener implements TransferListener {
+        @Override
         public void onStateChanged(int id, TransferState state) {
             switch (state) {
                 case COMPLETED:
-                    try {
-                        parentResult.success(fileNameWithExt);
-                    } catch (Exception e) {
-                        e.getMessage();
-                    }
-                    break;
-                case WAITING:
-                    Log.d(TAG, "onStateChanged: \"WAITING, " + fileNameWithExt);
+                    parentResult.success(fileNameWithExt);
                     break;
                 case FAILED:
-                    try {
-                        invalidateEventSink();
-                        Log.d(TAG, "onStateChanged: \"FAILED, " + fileNameWithExt);
-                        parentResult.success(null);
-                    } catch (Exception e) {
-                        e.getMessage();
-                    }
+                    Log.e(TAG, "Upload failed: " + fileNameWithExt);
+                    parentResult.success(null);
                     break;
                 default:
-                    Log.d(TAG, "onStateChanged: \"SOMETHING ELSE, " + fileNameWithExt);
-                    break;
+                    Log.d(TAG, "Transfer state: " + state + ", file: " + fileNameWithExt);
             }
         }
 
-        //    @Override
+        @Override
         public void onProgressChanged(int id, long bytesCurrent, long bytesTotal) {
-
-            float percentDoNef = ((float) bytesCurrent / (float) bytesTotal) * 100;
-            int percentDone = (int) percentDoNef;
-            Log.d(TAG, "ID:" + id + " bytesCurrent: " + bytesCurrent + " bytesTotal: " + bytesTotal + " " + percentDone + "%");
-
             if (events != null) {
-                try {
-                    events.success(percentDone);
-                } catch (Exception e) {
-                    e.getMessage();
-                }
+                int progress = (int) ((float) bytesCurrent / bytesTotal * 100);
+                events.success(progress);
             }
         }
 
-        //    @Override
+        @Override
         public void onError(int id, Exception ex) {
-            Log.e(TAG, "onError: " + ex);
+            Log.e(TAG, "Error during upload: ", ex);
             invalidateEventSink();
         }
     }
